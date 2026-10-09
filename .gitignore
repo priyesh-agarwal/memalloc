@@ -1,0 +1,9 @@
+/build/
+/experiment/build/
+/experiment/results/
+*.o
+*.so
+*.a
+*.out
+perf.data
+compile_commands.json
