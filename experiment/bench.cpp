@@ -110,7 +110,7 @@ static void calibrate() {
 
 static uint64_t samples[1 << 15];
 
-// One sample per 128 finished operations. A short final batch is divided by its own length.
+// One sample per 64 finished operations. A short final batch is divided by its own length.
 struct Lap {
     uint64_t t0;
     int begin;
@@ -124,7 +124,7 @@ static void lap_start(Lap& lap) {
 }
 
 static void lap_at(Lap& lap, int i, int n_ops) {
-    if ((i & 127) != 127 && i != n_ops - 1) return;
+    if ((i & 63) != 63 && i != n_ops - 1) return;
     uint64_t t1 = ticks();
     uint64_t count = static_cast<uint64_t>(i - lap.begin + 1);
     samples[lap.n++] = (t1 - lap.t0 + count / 2) / count;

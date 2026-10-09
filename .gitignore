@@ -1,6 +1,7 @@
 /build/
 /experiment/build/
 /experiment/results/
+/experiment/__pycache__/
 *.o
 *.so
 *.a

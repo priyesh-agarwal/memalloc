@@ -13,36 +13,29 @@ cmake -S . -B build
 cmake --build build
 
 cmake -S experiment -B experiment/build
-cmake --build experiment/build --target compare
 ```
 
 `libmemalloc.so` is compiled with the same codegen flags Ubuntu used for the installed tcmalloc and jemalloc packages: `-O2 -g`, frame pointers, stack protector, control-flow protection, LTO, `-Wl,-Bsymbolic-functions`, and relro. No `-O3` and no `-march=native`.
 
 The bench binary is built as `RelWithDebInfo`. It is not linked to an allocator.
 
-## Run one allocator
-
-`compare` runs the same bench four times. To run one:
+## Run the comparison
 
 ```bash
-cmake --build experiment/build --target bench
+sudo /bin/sh experiment/compare.sh
 ```
 
-That preloads `build/libmemalloc.so`. The others:
+`sudo` drops `LD_PRELOAD`, so the script sets it after it starts. That is what gets `SCHED_FIFO`. The script finds `libtcmalloc` and `libjemalloc` through `ldconfig`, which covers Debian multiarch and Fedora `/usr/lib64`. Point `TCMALLOC_LIB` or `JEMALLOC_LIB` at a `.so` if they live somewhere else.
 
-```bash
-LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4 ./experiment/build/memalloc_bench
-LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2 ./experiment/build/memalloc_bench
-./experiment/build/memalloc_bench
-```
+The same run locks the clock. The bench pins the highest-capacity core, and among those the highest index, so it stays off cpu 0. On a hybrid Intel CPU that core is a P-core. The script sets every core of that capacity to `performance` and to `base_frequency`, which is the non-turbo rate the package can hold. On the machine behind the table below, those cores are capacity 1024 and `base_frequency` is 2900 MHz. Intel hosts also get `intel_pstate/no_turbo` set. Hosts with no `cpu_capacity` file get every core locked the same way. The lock lasts until reboot.
 
-The last command is glibc ptmalloc. `sudo /bin/sh experiment/compare.sh` gives all four runs `SCHED_FIFO`. Without sudo they all stay on the normal scheduler.
+`FREQ_KHZ=2900000 sudo /bin/sh experiment/compare.sh` overrides the frequency. Use a rate the chip holds with turbo off, not the turbo maximum.
 
-Logs are written to `experiment/results/`.
+Each run should print `sched FIFO` and the locked frequency. Per-allocator logs and the combined report are written to `experiment/results/`. The report is `experiment/results/report.md`.
 
 ## Allocator comparison
 
-One bench binary, four allocators. glibc ptmalloc is the process default. tcmalloc, jemalloc, and memalloc are loaded with `LD_PRELOAD`. The median is from batch-of-128 `rdtsc` samples, except the short rows, which time every call. CPU 5 locked at 2900 MHz, `no_turbo` 1, TSC 0.271 ns/tick. 9 Oct 2026. All four runs used the normal scheduler.
+One bench binary, four allocators. glibc ptmalloc is the process default. tcmalloc, jemalloc, and memalloc are loaded with `LD_PRELOAD`. The median is from batch-of-64 `rdtsc` samples, except the short rows, which time every call. CPU 5 locked at 2900 MHz, `no_turbo` 1, TSC 0.271 ns/tick. 9 Oct 2026. All four runs used the normal scheduler.
 
 memalloc and tcmalloc both sit at **4.3 ns** for the hot 24-byte malloc/free pair, p50.
 

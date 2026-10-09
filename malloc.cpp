@@ -272,7 +272,8 @@ void do_free(void* ptr) {
     if (!inArena(slabs)) {
         std::byte* target = reinterpret_cast<std::byte*>(ptr) - kDirtyHeader;
         size_t bytes = *reinterpret_cast<size_t*>(target);
-        munmap(target, bytes);
+        // same effect as munmap(target, bytes), just that we aren't removing the VMA block;
+        madvise(target, bytes, MADV_DONTNEED);
         return;
     }
 

@@ -35,7 +35,8 @@ add_custom_target(bench
     VERBATIM
 )
 
-# One bench binary, preloaded with glibc (no preload), tcmalloc, jemalloc, and libmemalloc.
+# Fair run is: sudo /bin/sh experiment/compare.sh
+# This target does not get SCHED_FIFO, because cmake is not root.
 add_custom_target(compare
     COMMAND /bin/sh ${CMAKE_CURRENT_SOURCE_DIR}/compare.sh
     DEPENDS memalloc_bench
