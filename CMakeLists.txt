@@ -29,6 +29,9 @@ target_compile_options(memalloc PRIVATE
     -fcf-protection
     -flto=auto
     -ffat-lto-objects
+    # LD_PRELOAD, so initial-exec TLS is available. global-dynamic would
+    # call __tls_get_addr on the malloc fast path.
+    -ftls-model=initial-exec
 )
 target_link_options(memalloc PRIVATE
     -flto=auto

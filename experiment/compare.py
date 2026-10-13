@@ -4,12 +4,15 @@
 sudo /bin/sh experiment/compare.sh
 """
 
+import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 root = Path(__file__).resolve().parent.parent
+bench_cpp = root / "experiment/bench.cpp"
 bench = root / "experiment/build/memalloc_bench"
 ours = root / "build/libmemalloc.so"
 out = root / "experiment/results"
@@ -104,9 +107,15 @@ def run(name, preload):
     if preload:
         env["LD_PRELOAD"] = preload
     log = out / f"{name}.txt"
+    cmd = [
+        str(bench),
+        f"--benchmark_out={out / f'{name}.json'}",
+        "--benchmark_out_format=json",
+        "--benchmark_color=false",
+    ]
     with log.open("w") as fh:
         fh.write(f"=== {name} ===\n")
-        proc = subprocess.Popen([str(bench)], env=env, stdout=subprocess.PIPE, text=True)
+        proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, text=True)
         for line in proc.stdout:
             sys.stdout.write(line)
             fh.write(line)
@@ -114,22 +123,179 @@ def run(name, preload):
             sys.exit(proc.returncode)
 
 
+metrics = ["p50", "p99", "p99.9", "max"]
+
+# Google Benchmark has no description field in JSON; SetLabel() runs inside timed loops.
+# Docs live as // bench-desc: comments in bench.cpp (parsed here, zero runtime cost).
+BENCH_DESC_RE = re.compile(r"^\s*//\s*bench-desc(?:-([a-z0-9_]+))?:\s*(.+?)\s*$")
+BENCH_NAME_RE = re.compile(r'->Name\("([^"]+)"\)')
+
+
+def load_bench_descriptions():
+    """Map report row keys to text from bench.cpp (see bench-desc comments)."""
+    if not bench_cpp.is_file():
+        return {}
+    by_key = {}
+    pending = []
+    lines = bench_cpp.read_text().splitlines()
+    i = 0
+    while i < len(lines):
+        dm = BENCH_DESC_RE.match(lines[i])
+        if dm:
+            suffix = dm.group(1) or ""
+            pending.append((suffix, dm.group(2)))
+            i += 1
+            continue
+        if "BENCHMARK(" not in lines[i]:
+            if lines[i].strip():
+                pending = []
+            i += 1
+            continue
+        block = lines[i]
+        while ";" not in block and i + 1 < len(lines):
+            i += 1
+            block += "\n" + lines[i]
+        nm = BENCH_NAME_RE.search(block)
+        if nm and pending:
+            base = nm.group(1)
+            for suffix, text in pending:
+                if suffix:
+                    by_key[f"{base} {suffix}"] = text
+                else:
+                    by_key[base] = text
+        pending = []
+        i += 1
+    return by_key
+
+
+def fmt_arg(arg):
+    if arg.isdigit() and int(arg) >= 1024 and int(arg) % 1024 == 0:
+        n = int(arg)
+        return f"{n >> 20} MiB" if n % (1 << 20) == 0 else f"{n >> 10} KiB"
+    return arg
+
+
+def describe_case(meta, desc):
+    base, args, threads, sub = meta
+    text = desc.get(f"{base} {sub}") if sub else None
+    text = text or desc.get(base)
+    if not text:
+        return "(no // bench-desc above this BENCHMARK in experiment/bench.cpp)"
+    extra = []
+    if args:
+        extra.append(", ".join(fmt_arg(a) for a in args))
+    if threads:
+        extra.append(f"{threads} thread" + ("" if threads == 1 else "s"))
+    return f"{text} ({'; '.join(extra)})" if extra else text
+
+
+def glossary_section(rows, meta, desc):
+    if not rows:
+        return []
+    lines = [
+        "### What each case measures",
+        "",
+        "| Case | Meaning |",
+        "| --- | --- |",
+    ]
+    for row in rows:
+        meaning = describe_case(meta[row], desc).replace("|", "\\|")
+        lines.append(f"| {row} | {meaning} |")
+    lines.append("")
+    return lines
+
+
+# Path tokens Google Benchmark appends for run options, not user args.
+GB_OPTION_RE = re.compile(r"^(iterations|repeats|threads|min_time|min_warmup_time):|^(real|manual|process)_time$")
+
+
+def parse_name(b):
+    """(base, args, threads) from a Google Benchmark run name."""
+    base, *tokens = b["name"].split("/")
+    args = [t for t in tokens if not GB_OPTION_RE.match(t)]
+    threads = int(b.get("threads", 1)) if any(t.startswith("threads:") for t in tokens) else 0
+    return base, args, threads
+
+
+def row_label(base, args, threads, sub=""):
+    label = "/".join([base, *args])
+    if threads:
+        label += f" x{threads}"
+    if sub:
+        label += f" {sub}"
+    return label
+
+
+def table(title, note, rows, values, fmt):
+    lines = [f"### {title}", ""]
+    if note:
+        lines += [note, ""]
+    lines += [
+        "| Case | " + " | ".join(names) + " |",
+        "| --- |" + " ---: |" * len(names),
+    ]
+    for row in rows:
+        cols = [fmt(values[name, row]) if (name, row) in values else "-" for name in names]
+        lines.append("| " + " | ".join([row, *cols]) + " |")
+    lines.append("")
+    return lines
+
+
 def write_report():
     header = {name: {} for name in names}
-    cases = []
-    units = {}
-    values = {}
+    # Table placement comes from the JSON, not from benchmark names:
+    #   "<sub>.p50_ns" counters      -> latency tables (one row per counter prefix)
+    #   threads + items_per_second   -> throughput table
+    #   anything else                -> time per iteration table
+    lat_rows, lat = [], {}
+    tput_rows, tput = [], {}
+    time_rows, time_ns = [], {}
+    meta = {}
+    to_ns = {"ns": 1.0, "us": 1e3, "ms": 1e6, "s": 1e9}
+
+    def add(rows, row, info):
+        if row not in rows:
+            rows.append(row)
+        meta[row] = info
+
+    # Counters arrive sorted by name; list a benchmark's rows in the order their
+    # bench-desc-<row> lines appear in bench.cpp (e.g. malloc before free).
+    bench_desc = load_bench_descriptions()
+    desc_order = {key: i for i, key in enumerate(bench_desc)}
+
+    def sub_order(base, sub):
+        return desc_order.get(f"{base} {sub}", len(desc_order)), sub
+
     for name in names:
         for line in (out / f"{name}.txt").read_text().splitlines():
             if line.startswith(("sched ", "cpu ", "tsc ")):
                 header[name][line.split()[0]] = line
-            elif line.endswith(" ns") or line.endswith(" us"):
-                parts = line.split()
-                case = " ".join(parts[:-5])
-                if case not in units:
-                    cases.append(case)
-                    units[case] = parts[-1]
-                values[name, case] = parts[-5:-1]  # p50 p99 p99.9 max
+        data = json.loads((out / f"{name}.json").read_text())
+        for b in data["benchmarks"]:
+            if b.get("run_type", "iteration") != "iteration":
+                continue
+            base, args, threads = parse_name(b)
+            subs = sorted((k[: -len("p50_ns")].rstrip(".") for k in b if k.endswith("p50_ns")),
+                          key=lambda sub: sub_order(base, sub))
+            for sub in subs:
+                prefix = f"{sub}." if sub else ""
+                row = row_label(base, args, threads, sub)
+                add(lat_rows, row, (base, args, threads, sub))
+                lat[name, row] = [b[f"{prefix}{m}_ns"] for m in metrics]
+            if subs:
+                continue
+            row = row_label(base, args, threads)
+            if threads and "items_per_second" in b:
+                add(tput_rows, row, (base, args, threads, ""))
+                tput[name, row] = b["items_per_second"] / 1e6
+            else:
+                add(time_rows, row, (base, args, threads, ""))
+                time_ns[name, row] = b["real_time"] * to_ns[b.get("time_unit", "ns")]
+
+    missing = sorted({m[0] for m in meta.values() if m[0] not in bench_desc
+                      and not any(k.startswith(m[0] + " ") for k in bench_desc)})
+    for base in missing:
+        print(f"warning: no // bench-desc for {base} in {bench_cpp}", file=sys.stderr)
 
     lines = ["# Allocator comparison", ""]
     for name in names:
@@ -137,20 +303,26 @@ def write_report():
         lines.append(f"{name}: {h.get('sched', '')}; {h.get('cpu', '')}; {h.get('tsc', '')}")
     lines += [
         "",
-        "Median of batch-of-64 rdtsc samples, except the short rows, which time every call. Rows with 14, 16, or 50 samples have p99 equal to the max.",
+        "Single-thread latency in ns. Loop cases store the mean of each batch of 64 calls; "
+        "one-shot cases time every call, so with 14-50 samples p99 is the max.",
+        "",
+        "Case meanings come from the `// bench-desc:` comments above each `BENCHMARK` in "
+        "`experiment/bench.cpp`.",
         "",
     ]
-    for index, metric in enumerate(["p50", "p99", "p99.9", "max"]):
-        lines += [
-            f"### {metric}",
-            "",
-            "| Case | glibc | tcmalloc | jemalloc | memalloc | Unit |",
-            "| --- | ---: | ---: | ---: | ---: | --- |",
-        ]
-        for case in cases:
-            cols = [values[name, case][index] for name in names]
-            lines.append("| " + " | ".join([case, *cols, units[case]]) + " |")
-        lines.append("")
+    lines += glossary_section(lat_rows + tput_rows + time_rows, meta, bench_desc)
+    for index, metric in enumerate(metrics):
+        lines += table(f"{metric} (ns)", "", lat_rows,
+                       {k: v[index] for k, v in lat.items()}, lambda v: f"{v:.1f}")
+    lines += table(
+        "Multithread throughput (M items/s, higher is better)",
+        "Items per second summed over threads (for these cases, malloc and free calls). "
+        "`xN` is the thread count; each thread is pinned to its own core.",
+        tput_rows, tput, lambda v: f"{v:.1f}")
+    lines += table(
+        "Time per iteration (ns, lower is better)",
+        "The case meaning says what one iteration does.",
+        time_rows, time_ns, lambda v: f"{v:.1f}")
     text = "\n".join(lines) + "\n"
     (out / "report.md").write_text(text)
     print(text, end="")

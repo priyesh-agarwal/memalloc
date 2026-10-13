@@ -1,8 +1,12 @@
+#include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 extern "C" {
@@ -23,6 +27,153 @@ static void check(void* p, size_t n, unsigned char tag) {
         assert(b[i] == static_cast<unsigned char>(tag + i));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Multithreaded stress. Every thread allocates random sizes (mostly small, some slab
+// sizes up to 512KB, a few large blocks), and randomly frees its own blocks, reallocs
+// them, or hands them to another thread to free. Each live block holds a pattern unique
+// to it, checked before every free and realloc, so overlapping blocks, a block handed
+// out twice, or a lost write show up as an assert.
+
+namespace stress {
+
+constexpr int kThreads = 8;
+constexpr int kOpsPerThread = 300'000;
+constexpr size_t kMaxLive = 4096;
+constexpr size_t kEdge = 256;  // pattern covers the first and last kEdge bytes
+
+struct Blk {
+    unsigned char* p;
+    size_t n;
+    uint32_t id;
+};
+
+struct Inbox {
+    std::mutex mu;
+    std::vector<Blk> items;
+};
+
+Inbox inbox[kThreads];
+std::atomic<int> finished{0};
+
+uint32_t next_rand(uint32_t& x) {
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    return x;
+}
+
+size_t pick_size(uint32_t& x) {
+    uint32_t r = next_rand(x) % 1000;
+    uint32_t v = next_rand(x);
+    if (r < 700) return 1 + v % 256;
+    if (r < 950) return 1 + v % 16384;
+    if (r < 995) return 1 + v % (512 * 1024);
+    return 512 * 1024 + 1 + v % (3 * 1024 * 1024);
+}
+
+unsigned char pat(uint32_t id, size_t i) {
+    return static_cast<unsigned char>((id * 2654435761u + static_cast<uint32_t>(i) * 40503u) >> 24);
+}
+
+template <typename F>
+void for_covered(size_t n, F f) {
+    if (n <= 2 * kEdge) {
+        for (size_t i = 0; i < n; ++i) f(i);
+        return;
+    }
+    for (size_t i = 0; i < kEdge; ++i) f(i);
+    for (size_t i = n - kEdge; i < n; ++i) f(i);
+}
+
+void fill_blk(const Blk& b) {
+    for_covered(b.n, [&](size_t i) { b.p[i] = pat(b.id, i); });
+}
+
+void check_blk(const Blk& b) {
+    for_covered(b.n, [&](size_t i) { assert(b.p[i] == pat(b.id, i)); });
+}
+
+// 16-byte alignment, except requests under 16 bytes, which get 8 (as in tcmalloc and
+// jemalloc: no type with 16-byte alignment fits in them).
+void check_aligned(void* p, size_t n) {
+    assert(p);
+    assert(reinterpret_cast<uintptr_t>(p) % (n < 16 ? 8 : 16) == 0);
+}
+
+Blk make_blk(size_t n, uint32_t id) {
+    auto* p = static_cast<unsigned char*>(malloc(n));
+    check_aligned(p, n);
+    Blk b{p, n, id};
+    fill_blk(b);
+    return b;
+}
+
+void drain(int self) {
+    std::vector<Blk> got;
+    {
+        std::lock_guard lock(inbox[self].mu);
+        got.swap(inbox[self].items);
+    }
+    for (const Blk& b : got) {
+        check_blk(b);
+        free(b.p);
+    }
+}
+
+void worker(int self) {
+    uint32_t x = 0x9e3779b9u ^ static_cast<uint32_t>(self * 7919 + 1);
+    uint32_t id = static_cast<uint32_t>(self) << 24;
+    std::vector<Blk> live;
+    live.reserve(kMaxLive);
+
+    for (int op = 0; op < kOpsPerThread; ++op) {
+        uint32_t r = next_rand(x) % 100;
+        if (live.empty() || (r < 45 && live.size() < kMaxLive)) {
+            live.push_back(make_blk(pick_size(x), ++id));
+        } else {
+            size_t k = next_rand(x) % live.size();
+            Blk b = live[k];
+            check_blk(b);
+            if (r < 75) {
+                free(b.p);
+                live[k] = live.back();
+                live.pop_back();
+            } else if (r < 90) {
+                int to = (self + 1 + static_cast<int>(next_rand(x) % (kThreads - 1))) % kThreads;
+                std::lock_guard lock(inbox[to].mu);
+                inbox[to].items.push_back(b);
+                live[k] = live.back();
+                live.pop_back();
+            } else {
+                size_t n = pick_size(x);
+                auto* p = static_cast<unsigned char*>(realloc(b.p, n));
+                check_aligned(p, n);
+                size_t kept = std::min({b.n, n, kEdge});
+                for (size_t i = 0; i < kept; ++i) assert(p[i] == pat(b.id, i));
+                live[k] = Blk{p, n, ++id};
+                fill_blk(live[k]);
+            }
+        }
+        if ((op & 63) == 0) drain(self);
+    }
+
+    finished.fetch_add(1);
+    while (finished.load() < kThreads) std::this_thread::yield();
+    drain(self);
+    for (const Blk& b : live) {
+        check_blk(b);
+        free(b.p);
+    }
+}
+
+void run() {
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t) threads.emplace_back(worker, t);
+    for (auto& t : threads) t.join();
+}
+
+}  // namespace stress
 
 int main() {
     assert(malloc(0) != nullptr);
@@ -74,45 +225,34 @@ int main() {
     assert(gone2);
     free(gone2);
 
-    // 1MB slabs hold 4 blocks. The 5th starts a new slab. Freeing a full slab
-    // appends it at the tail, so malloc keeps bumping the new head.
+    // 1MB is above the slab limit (512KB), so it comes from the large pool. A freed
+    // block goes back on its size-class list and the next malloc of that class reuses it.
     constexpr size_t MB = 1024 * 1024;
     unsigned char* p0 = static_cast<unsigned char*>(malloc(MB));
     unsigned char* p1 = static_cast<unsigned char*>(malloc(MB));
-    unsigned char* p2 = static_cast<unsigned char*>(malloc(MB));
-    unsigned char* p3 = static_cast<unsigned char*>(malloc(MB));
-    assert(p1 == p0 + MB && p2 == p0 + 2 * MB && p3 == p0 + 3 * MB);
-    fill(p0, 16, 1);
-    unsigned char* q0 = static_cast<unsigned char*>(malloc(MB));
-    assert(q0 != p0);
+    assert(p1 != p0);
+    // Payload past the first word survives free and reuse.
+    constexpr size_t kLink = sizeof(void*);
+    fill(p0 + kLink, 16, 1);
     free(p0);
-    unsigned char* q1 = static_cast<unsigned char*>(malloc(MB));
-    unsigned char* q2 = static_cast<unsigned char*>(malloc(MB));
-    unsigned char* q3 = static_cast<unsigned char*>(malloc(MB));
-    assert(q1 == q0 + MB && q2 == q0 + 2 * MB && q3 == q0 + 3 * MB);
     unsigned char* back = static_cast<unsigned char*>(malloc(MB));
     assert(back == p0);
-    check(back, 16, 1);
+    check(back + kLink, 16, 1);
     free(p1);
-    free(p2);
-    free(p3);
-    free(q0);
-    free(q1);
-    free(q2);
-    free(q3);
     free(back);
 
-    // Bitmask class: 65536 bytes, 63 blocks per slab.
+    // 65536-byte class: 16 blocks per 1MB slab.
     constexpr size_t BM = 65536;
+    constexpr int kPerSlab = 16;
     std::vector<unsigned char*> blocks;
     blocks.push_back(static_cast<unsigned char*>(malloc(BM)));
-    for (int i = 1; i < 63; ++i) {
+    for (int i = 1; i < kPerSlab; ++i) {
         auto* p = static_cast<unsigned char*>(malloc(BM));
         assert(p == blocks[0] + i * BM);
         blocks.push_back(p);
     }
     auto* next_slab = static_cast<unsigned char*>(malloc(BM));
-    assert(next_slab != blocks[0] + 63 * BM);
+    assert(next_slab != blocks[0] + kPerSlab * BM);
     for (auto* p : blocks) free(p);
     free(next_slab);
 
@@ -155,6 +295,8 @@ int main() {
         assert(*static_cast<int*>(p) == i);
         free(p);
     }
+
+    stress::run();
 
     std::cout << "ok\n";
 }
