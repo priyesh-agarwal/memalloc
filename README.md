@@ -39,7 +39,18 @@ A thread-caching `malloc` for Linux, written in C++20. Drop it into any program 
 
 All allocator code lives in headers (`slab_alloc.h`, `large_alloc.h`) and compiles into one translation unit (`malloc.cpp`), so the whole fast path is inlined into `malloc` and `free`.
 
-## Results
+### Layout
+
+| File | Contents |
+| --- | --- |
+| `malloc.cpp` | `malloc`, `free`, `calloc`, `realloc`, and the free path |
+| `slab_alloc.h` | arenas, slabs, size classes, thread-local lists, cross-thread frees |
+| `large_alloc.h` | large size classes and pooled `mmap` blocks |
+| `experiment/test_alloc.cpp` | tests, including the multithreaded stress test |
+| `experiment/bench.cpp` | Google Benchmark cases |
+| `experiment/compare.py` | runs all allocators and writes the report |
+
+## Benchmarks
 
 One benchmark binary, four allocators. glibc's ptmalloc is the process default; tcmalloc, jemalloc and memalloc are loaded with `LD_PRELOAD`.
 
@@ -78,14 +89,19 @@ Tail latency is low as well. The first malloc of a new size has a p99 of 370 ns,
 | `vector::reserve(16 MiB)`, write one byte | 48.5 | 61.3 | 4116 | **42.4** |
 | build a 4 KiB `std::string` by appending | 623 | **503** | 560 | 564 |
 
-## Performance findings
+### Running the benchmarks
 
-Most of the work on the fast path came from reading disassembly, not from changing the algorithm.
+After building (see [Build and test](#build-and-test)):
 
-- **One translation unit is 2.7× faster on the hot path.** With the slab code in its own `.cpp` file, GCC did not inline it into `malloc` and `free` inside the shared library, and a malloc+free pair took 17.6 ns. Moving the code into headers included by `malloc.cpp` brought it to 6.5 ns.
-- **A `thread_local` with an initializer costs 2 ns on every `free`.** The thread id was a `thread_local` set by a lambda, so every read went through a compiler-generated "TLS init" call, with seven registers saved and restored around it. Making it a `constinit` value that is assigned on the thread's first slow-path allocation removed the call and brought the pair from 6.5 to 4.3 ns. A thread that has not allocated yet can't own a slab, so its frees correctly take the cross-thread path.
-- **glibc's mutex is a benchmark trap.** In a process that has never started a second thread, glibc's `std::mutex` skips its atomic instructions. An uncontended lock looked 2× cheaper than a spinlock in single-thread benchmarks, but became 1.7× more expensive (41 ns against 24.6 ns per large malloc+free) once any thread had been created.
-- **Benchmarks must touch memory.** An allocator that returns untouched pages looks extremely fast in a loop that never writes to its blocks. Writing each block after `malloc` moved memalloc's 64-byte bump allocation from 3.5 ns to 26 ns, in line with the others. It also moved the cost of a "slow" 1.4 µs free (a page fault on the first write) into the program, where it belongs.
+```bash
+sudo /bin/sh experiment/compare.sh
+```
+
+The script runs `experiment/build/memalloc_bench` once per allocator, finding tcmalloc and jemalloc through `ldconfig`. You can override their paths with `TCMALLOC_LIB` and `JEMALLOC_LIB`. It writes the logs, JSON results and `experiment/results/report.md`.
+
+`sudo` is only needed for consistent conditions. The script pins the benchmark to the highest-capacity core, which is a P-core on hybrid Intel CPUs, locks that core's clock to its base frequency with turbo off, and runs with `SCHED_FIFO`. Override the frequency with `FREQ_KHZ`. The clock lock lasts until reboot.
+
+Each benchmark has a one-line description in a `// bench-desc:` comment in `bench.cpp`. `compare.py` reads these into the report, so adding a benchmark needs no change to the script.
 
 ## Build and test
 
@@ -110,18 +126,6 @@ The tests in `experiment/test_alloc.cpp` cover:
 - C++ containers;
 - a multithreaded stress test. Eight threads allocate random sizes from 1 byte to 3.5 MiB, and randomly free, `realloc`, or hand blocks to another thread to free. Each block carries a unique pattern that is checked before it is freed, so overlapping blocks, a block handed out twice, or lost writes all fail an assert.
 
-## Benchmarks
-
-```bash
-sudo /bin/sh experiment/compare.sh
-```
-
-The script runs `experiment/build/memalloc_bench` once per allocator, finding tcmalloc and jemalloc through `ldconfig`. You can override their paths with `TCMALLOC_LIB` and `JEMALLOC_LIB`. It writes the logs, JSON results and `experiment/results/report.md`.
-
-`sudo` is only needed for consistent conditions. The script pins the benchmark to the highest-capacity core, which is a P-core on hybrid Intel CPUs, locks that core's clock to its base frequency with turbo off, and runs with `SCHED_FIFO`. Override the frequency with `FREQ_KHZ`. The clock lock lasts until reboot.
-
-Each benchmark has a one-line description in a `// bench-desc:` comment in `bench.cpp`. `compare.py` reads these into the report, so adding a benchmark needs no change to the script.
-
 ## Scope
 
 memalloc focuses on the allocation fast paths. It implements `malloc`, `free`, `calloc` and `realloc`.
@@ -138,17 +142,6 @@ Each of these comes from a benchmark where tcmalloc or jemalloc still lead, and 
 - **A per-thread cache for large blocks.** Today every thread shares one list and mutex per large size class. A cache of one or two blocks per thread in front of the shared lists would let threads that reuse large buffers skip the lock entirely.
 - **Replace `operator new` and `operator delete`.** C++ code currently goes through libstdc++ to reach `malloc`. Overriding the operators directly, including sized `delete`, which tells the allocator the size class, would cut a call and a lookup from every C++ allocation.
 - **Return idle memory and recycle thread ids.** `madvise` idle slabs back to the OS on a timer, reclaim a thread's slabs and id when it exits, and add `pthread_atfork` handlers for the large-pool mutexes.
-
-## Layout
-
-| File | Contents |
-| --- | --- |
-| `malloc.cpp` | `malloc`, `free`, `calloc`, `realloc`, and the free path |
-| `slab_alloc.h` | arenas, slabs, size classes, thread-local lists, cross-thread frees |
-| `large_alloc.h` | large size classes and pooled `mmap` blocks |
-| `experiment/test_alloc.cpp` | tests, including the multithreaded stress test |
-| `experiment/bench.cpp` | Google Benchmark cases |
-| `experiment/compare.py` | runs all allocators and writes the report |
 
 ## License
 
